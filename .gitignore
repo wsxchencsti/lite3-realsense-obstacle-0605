@@ -1,0 +1,41 @@
+# 环境变量文件
+.env
+
+# 虚拟环境目录
+.venv/
+
+# 临时文件目录
+.temp/
+
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE 配置（可选，建议添加）
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 操作系统生成文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
+# 数据库文件
+*.db
+*.sqlite
+
+# 测试覆盖率报告
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.pytest_cache/
+
+# 打包文件
+*.egg-info/
+dist/   
