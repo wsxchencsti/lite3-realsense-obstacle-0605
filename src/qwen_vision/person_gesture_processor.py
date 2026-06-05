@@ -87,6 +87,16 @@ class PersonGestureProcessor:
 
             if self._is_processing:
                 self._skipped_while_busy += 1
+                busy_for = None
+                if self._current_submitted_at is not None:
+                    busy_for = now - self._current_submitted_at
+                _log_api_status(
+                    "WAIT busy tag={} busy={} skipped={}".format(
+                        self.last_request_tag or "--",
+                        "--" if busy_for is None else _format_seconds(busy_for),
+                        self._skipped_while_busy,
+                    )
+                )
                 return False
 
             self._is_processing = True
@@ -94,6 +104,15 @@ class PersonGestureProcessor:
             self._skipped_while_busy = 0
             self.last_candidate_count = len(people)
             self.last_request_tag = request_tag
+
+        _log_api_status(
+            "WAIT submit tag={} candidates={} ids={} priority={}".format(
+                request_tag or "--",
+                len(people),
+                _format_people(people),
+                ",".join(priority_labels) if priority_labels else "--",
+            )
+        )
 
         worker = threading.Thread(
             target=self._process_worker,
@@ -132,12 +151,25 @@ class PersonGestureProcessor:
             for person in people:
                 roi = crop_person_roi(frame, person, self.roi_pad_ratio)
                 if roi is None:
+                    _log_api_status(
+                        "SKIP tag={} id={} reason=empty_roi".format(
+                            request_tag or "--",
+                            person_identity(person),
+                        )
+                    )
                     continue
 
                 image_bytes = encode_frame(roi)
                 if SAVE_PIC:
                     saved_path = save_image(image_bytes, person_identity(person))
 
+                _log_api_status(
+                    "SEND tag={} id={} conf={:.2f}".format(
+                        request_tag or "--",
+                        person_identity(person),
+                        float(getattr(person, "confidence", 0.0)),
+                    )
+                )
                 gesture_index = analyze_gesture(image_bytes)
                 gesture_label = gesture_label_from_index(gesture_index)
                 candidate = PersonGestureResult(
@@ -155,9 +187,9 @@ class PersonGestureProcessor:
             result = _select_result(results, priority_labels)
         except Exception as exc:
             error = str(exc)
-            print(f"api person gesture processing failed: {exc}")
         finally:
             finished_at = time.monotonic()
+            latency_seconds = finished_at - submitted_at
             with self._lock:
                 if saved_path is not None:
                     self.last_saved_path = saved_path
@@ -170,9 +202,36 @@ class PersonGestureProcessor:
                     self.last_error = error
 
                 self._last_completed_submitted_at = submitted_at
-                self._last_latency_seconds = finished_at - submitted_at
+                self._last_latency_seconds = latency_seconds
                 self._current_submitted_at = None
                 self._is_processing = False
+
+            if error is not None:
+                _log_api_status(
+                    "ERROR tag={} latency={} error={}".format(
+                        request_tag or "--",
+                        _format_seconds(latency_seconds),
+                        error,
+                    )
+                )
+            elif result is None:
+                _log_api_status(
+                    "RETURN tag={} result=none latency={}".format(
+                        request_tag or "--",
+                        _format_seconds(latency_seconds),
+                    )
+                )
+            else:
+                _log_api_status(
+                    "RETURN tag={} id={} gesture={} index={} conf={:.2f} latency={}".format(
+                        request_tag or "--",
+                        result.person_id,
+                        result.gesture_label,
+                        result.gesture_index,
+                        result.confidence,
+                        _format_seconds(latency_seconds),
+                    )
+                )
 
     @property
     def status_lines(self):
@@ -267,3 +326,20 @@ def _format_busy(now, is_processing, current_submitted_at, skipped_while_busy):
 
 def _format_seconds(seconds):
     return f"{max(0.0, seconds):.1f}s"
+
+
+def _format_people(people):
+    parts = []
+    for person in people:
+        parts.append(
+            "{}:{:.2f}".format(
+                person_identity(person),
+                float(getattr(person, "confidence", 0.0)),
+            )
+        )
+    return "[" + ", ".join(parts) + "]"
+
+
+def _log_api_status(message):
+    timestamp = time.strftime("%H:%M:%S")
+    print(f"[QWEN_API][{timestamp}] {message}", flush=True)

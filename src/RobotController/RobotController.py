@@ -77,6 +77,25 @@ kGridUnknown = -1
 kGridFree = 0
 kGridOccupied = 1
 kGridInflated = 2
+kScreenFontScale = 1.6
+kScreenFontThickness = 2
+kScreenLineHeight = 26
+kScreenLabelFontScale = 2.4
+kScreenLabelThickness = 3
+kScreenLineType = getattr(cv2, "LINE_AA", 16)
+
+
+def DrawScreenText(frame, text, position, color, scale=kScreenFontScale, thickness=kScreenFontThickness):
+    return cv2.putText(
+        frame,
+        text,
+        position,
+        cv2.FONT_HERSHEY_PLAIN,
+        scale,
+        color,
+        thickness,
+        kScreenLineType,
+    )
 
 class RobotController(object):
     def __init__(self):
@@ -208,6 +227,8 @@ class RobotController(object):
         self.SetIsTracking(True)
         self.ResetStandbyIntentConfirmation()
         self.intent_last_action = "{} id {}".format(action, target_id)
+        if action.startswith("intent"):
+            print("[INTENT_ACTION] {}".format(self.intent_last_action), flush=True)
         return True
 
     def ResetTrackingState(self, action="reset_tracking"):
@@ -217,6 +238,8 @@ class RobotController(object):
         self.SetIsTracking(False)
         self.ResetStandbyIntentConfirmation()
         self.intent_last_action = action
+        if action.startswith("intent"):
+            print("[INTENT_ACTION] {}".format(self.intent_last_action), flush=True)
 
     def GetTrackingIntentTag(self, target_id=None):
         if target_id is None:
@@ -322,7 +345,7 @@ class RobotController(object):
 
     def DrawIntentInfo(self, frame, y):
         if not AUTONOMOUS_INTENT_ENABLED:
-            cv2.putText(frame, "intent disabled", (0, y), cv2.FONT_HERSHEY_PLAIN, 1.2, [128, 128, 128], 1)
+            DrawScreenText(frame, "intent disabled", (0, y), [128, 128, 128])
             return
 
         confirm_id = getattr(self, "intent_thumb_candidate_id", None)
@@ -337,14 +360,19 @@ class RobotController(object):
                 TRACKING_ENTER_CONFIRMATIONS,
             )
 
-        cv2.putText(frame, mode_text, (0, y), cv2.FONT_HERSHEY_PLAIN, 1.2, [0, 128, 255], 1)
-        cv2.putText(frame, "intent action {}".format(action), (0, y + 18), cv2.FONT_HERSHEY_PLAIN, 1.2, [0, 128, 255], 1)
+        DrawScreenText(frame, mode_text, (0, y), [0, 128, 255])
+        DrawScreenText(frame, "intent action {}".format(action), (0, y + kScreenLineHeight), [0, 128, 255])
 
         processor = self.GetIntentProcessor()
         if processor is None:
             return
-        for index, line in enumerate(processor.status_lines[:3]):
-            cv2.putText(frame, line, (0, y + 36 + index * 18), cv2.FONT_HERSHEY_PLAIN, 1.2, [0, 128, 255], 1)
+        for index, line in enumerate(processor.status_lines[:1]):
+            DrawScreenText(
+                frame,
+                line,
+                (0, y + 2 * kScreenLineHeight + index * kScreenLineHeight),
+                [0, 128, 255],
+            )
 
     def FindTarget(self, boxes):
         for box in boxes:
@@ -584,8 +612,12 @@ class RobotController(object):
             distance_text = "--"
         else:
             distance_text = "{:.2f}".format(front_distance)
-        cv2.putText(frame,"obs {} front {}".format(obstacle_info["mode"], distance_text),
-                    (0,y), cv2.FONT_HERSHEY_PLAIN, 1.2, [0,128,255], 1)
+        DrawScreenText(
+            frame,
+            "obs {} front {}".format(obstacle_info["mode"], distance_text),
+            (0, y),
+            [0, 128, 255],
+        )
 
     def DrawPlanningInfo(self, frame, grid_info, planner_info, target_robot, image_width, y):
         target_text = "--"
@@ -599,9 +631,13 @@ class RobotController(object):
             branch_text = "{} {}".format(self.current_branch["name"], self.branch_phase)
         elif len(self.branch_queue) > 0:
             branch_text = "queue {}".format(len(self.branch_queue))
-        cv2.putText(frame,"state {} conf {:.2f} target {} near {} branch {}".format(
-                    self.track_state, self.prediction_confidence, target_text, nearest, branch_text),
-                    (0,y), cv2.FONT_HERSHEY_PLAIN, 1.2, [0,128,255], 1)
+        DrawScreenText(
+            frame,
+            "state {} conf {:.2f} target {} near {} branch {}".format(
+                self.track_state, self.prediction_confidence, target_text, nearest, branch_text),
+            (0, y),
+            [0, 128, 255],
+        )
 
         if target_robot is not None:
             center = (image_width // 2, 455)
@@ -1325,7 +1361,7 @@ class RobotController(object):
             receive_count = 0
             if odom_status is not None:
                 _, _, receive_count, _ = odom_status
-            cv2.putText(frame,"odom invalid recv {}".format(receive_count),(0,y), cv2.FONT_HERSHEY_PLAIN, 1.2, [0,0,255], 1)
+            DrawScreenText(frame, "odom invalid recv {}".format(receive_count), (0, y), [0, 0, 255])
             return
 
         robot_x, robot_y, robot_yaw = odom_pose
@@ -1336,10 +1372,13 @@ class RobotController(object):
             age_text = "--" if age is None else "{:.2f}s".format(age)
             qos_text = " qos {} age {}".format(qos_name, age_text)
 
-        cv2.putText(frame,"odom x {:.2f} y {:.2f} yaw {:.2f}".format(robot_x, robot_y, robot_yaw),
-                    (0,y), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
-        cv2.putText(frame,"odom {}{}".format(topic_text, qos_text),
-                    (0,y + 18), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
+        DrawScreenText(
+            frame,
+            "odom x {:.2f} y {:.2f} yaw {:.2f}".format(robot_x, robot_y, robot_yaw),
+            (0, y),
+            [255, 0, 0],
+        )
+        DrawScreenText(frame, "odom {}{}".format(topic_text, qos_text), (0, y + kScreenLineHeight), [255, 0, 0])
     
     def InputAndProcess(self, frame, key):
         if(self.GetIsTracking() == False):
@@ -1369,8 +1408,7 @@ class RobotController(object):
         planner_target_robot = None
 
         self.fps_counter.Count()
-        frame = cv2.putText(frame, "fps {:.1f}".format(self.fps_counter.GetFps()), (10, 20),
-                    cv2.FONT_HERSHEY_PLAIN, 1.2, [0, 128, 0], 1)
+        frame = DrawScreenText(frame, "fps {:.1f}".format(self.fps_counter.GetFps()), (10, 24), [0, 128, 0])
         self.InputAndProcess(frame, key)
 
         if(box != None):            
@@ -1457,33 +1495,45 @@ class RobotController(object):
 
             #draw
             label = '{}{:d}'.format("", self.GetTargetId())
-            t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 2 , 2)[0]
+            t_size = cv2.getTextSize(
+                label,
+                cv2.FONT_HERSHEY_PLAIN,
+                kScreenLabelFontScale,
+                kScreenLabelThickness,
+            )[0]
             cv2.rectangle(frame, (x1, y1), (x2, y2), [255,128,128], 2)
             if depth_region is not None:
                 rx1, ry1, rx2, ry2 = depth_region
                 cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), [0,255,0], 2)
             cv2.rectangle(frame,(x1, y1),(x1+t_size[0]+3,y1+t_size[1]+4), [255,128,128],-1)
-            cv2.putText(frame,label,(x1,y1+t_size[1]+4), cv2.FONT_HERSHEY_PLAIN, 2, [255,255,255], 2)
+            DrawScreenText(
+                frame,
+                label,
+                (x1, y1 + t_size[1] + 4),
+                [255, 255, 255],
+                kScreenLabelFontScale,
+                kScreenLabelThickness,
+            )
 
-            cv2.putText(frame,"ID {:} enter reset".format(self.GetTargetId()),(20,125), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
-            self.DrawIntentInfo(frame, 145)
+            DrawScreenText(frame, "ID {:} enter reset".format(self.GetTargetId()), (20, 125), [255, 0, 0])
+            self.DrawIntentInfo(frame, 152)
             self.DrawOdomPose(frame, odom_pose, 50, odom_topic, odom_status)
-            cv2.putText(frame,"v {:.2f} m/s".format(linear_velocity),(0,250), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
-            cv2.putText(frame,"w {:.2f} rad/s".format(radian_velocity),(0,270), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
+            DrawScreenText(frame, "v {:.2f} m/s".format(linear_velocity), (0, 255), [255, 0, 0])
+            DrawScreenText(frame, "w {:.2f} rad/s".format(radian_velocity), (0, 281), [255, 0, 0])
             self.DrawObstacleInfo(frame, obstacle_info, 410)
             self.DrawPlanningInfo(frame, local_grid_info, planner_info, planner_target_robot, shape[1], 430)
             if person_distance is not None:
-                cv2.putText(frame,"depth {:.2f} target {:.2f}".format(person_distance, kTargetDistance),(0,290), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
-                cv2.putText(frame,"mode {} err {:.2f} target_v {:.2f}".format(control_mode, distance_error, target_linear_velocity),(0,310), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
+                DrawScreenText(frame, "depth {:.2f} target {:.2f}".format(person_distance, kTargetDistance), (0, 307), [255, 0, 0])
+                DrawScreenText(frame, "mode {} err {:.2f} target_v {:.2f}".format(control_mode, distance_error, target_linear_velocity), (0, 333), [255, 0, 0])
                 if person_point is not None:
-                    cv2.putText(frame,"rel x {:.2f} z {:.2f} head {:.2f}".format(person_lateral, person_forward, person_heading_error),(0,330), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
+                    DrawScreenText(frame, "rel x {:.2f} z {:.2f} head {:.2f}".format(person_lateral, person_forward, person_heading_error), (0, 359), [255, 0, 0])
                     if person_odom is not None:
-                        cv2.putText(frame,"person odom x {:.2f} y {:.2f}".format(person_odom[0], person_odom[1]),(0,350), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
-                        cv2.putText(frame,"path n {:d} idx {}->{}".format(len(self.person_path), path_closest_index, path_target_index),(0,370), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
+                        DrawScreenText(frame, "person odom x {:.2f} y {:.2f}".format(person_odom[0], person_odom[1]), (0, 385), [255, 0, 0])
+                        DrawScreenText(frame, "path n {:d} idx {}->{}".format(len(self.person_path), path_closest_index, path_target_index), (0, 411), [255, 0, 0])
                 if control_forward is not None and heading_error is not None:
-                    cv2.putText(frame,"ctrl x {:.2f} z {:.2f} head {:.2f}".format(control_lateral, control_forward, heading_error),(0,390), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
+                    DrawScreenText(frame, "ctrl x {:.2f} z {:.2f} head {:.2f}".format(control_lateral, control_forward, heading_error), (0, 437), [255, 0, 0])
             else:
-                cv2.putText(frame,"depth invalid",(0,290), cv2.FONT_HERSHEY_PLAIN, 1.2, [0,0,255], 1)
+                DrawScreenText(frame, "depth invalid", (0, 307), [0, 0, 255])
 
             #pub cmdvel
             if kUseRos1Transfer:
@@ -1580,24 +1630,23 @@ class RobotController(object):
                 self.ros2_transfer.SendCmdVel(linear_velocity, radian_velocity)
             self.last_linear_velocity = linear_velocity
             self.DrawOdomPose(frame, odom_pose, 50, odom_topic, odom_status)
-            cv2.putText(frame,"lost ID {:}".format(self.GetTargetId()),(20,100), cv2.FONT_HERSHEY_PLAIN, 1.2, [0,0,255], 1)
-            cv2.putText(frame,"enter reset",(20,120), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
-            self.DrawIntentInfo(frame, 140)
-            cv2.putText(frame,"v {:.2f} m/s".format(linear_velocity),(0,250), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
-            cv2.putText(frame,"w {:.2f} rad/s".format(radian_velocity),(0,270), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
-            cv2.putText(frame,"mode {} target_v {:.2f}".format(control_mode, target_linear_velocity),(0,290), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
-            cv2.putText(frame,"path n {:d} idx {}->{}".format(len(self.person_path), path_info["closest_index"], path_info["target_index"]),(0,310), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
+            DrawScreenText(frame, "lost ID {:}".format(self.GetTargetId()), (20, 100), [0, 0, 255])
+            DrawScreenText(frame, "enter reset", (20, 126), [255, 0, 0])
+            self.DrawIntentInfo(frame, 152)
+            DrawScreenText(frame, "v {:.2f} m/s".format(linear_velocity), (0, 255), [255, 0, 0])
+            DrawScreenText(frame, "w {:.2f} rad/s".format(radian_velocity), (0, 281), [255, 0, 0])
+            DrawScreenText(frame, "mode {} target_v {:.2f}".format(control_mode, target_linear_velocity), (0, 307), [255, 0, 0])
+            DrawScreenText(frame, "path n {:d} idx {}->{}".format(len(self.person_path), path_info["closest_index"], path_info["target_index"]), (0, 333), [255, 0, 0])
             self.DrawObstacleInfo(frame, obstacle_info, 350)
             self.DrawPlanningInfo(frame, local_grid_info, planner_info, planner_target_robot, shape[1], 370)
             if path_info["forward"] is not None and path_info["heading_error"] is not None:
-                cv2.putText(frame,"ctrl x {:.2f} z {:.2f} head {:.2f}".format(path_info["lateral"], path_info["forward"], path_info["heading_error"]),(0,330), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
+                DrawScreenText(frame, "ctrl x {:.2f} z {:.2f} head {:.2f}".format(path_info["lateral"], path_info["forward"], path_info["heading_error"]), (0, 385), [255, 0, 0])
             return frame
 
     def NonTrackAndDraw(self, frame, odom_pose=None, odom_topic=None, odom_status=None, key=-1):
         frame = cv2.UMat(frame)
         self.fps_counter.Count()
-        frame = cv2.putText(frame, "fps {:.1f}".format(self.fps_counter.GetFps()), (10, 20),
-                    cv2.FONT_HERSHEY_PLAIN, 1.2, [0, 128, 0], 1)
+        frame = DrawScreenText(frame, "fps {:.1f}".format(self.fps_counter.GetFps()), (10, 24), [0, 128, 0])
         self.InputAndProcess(frame, key)
         if kUseRos1Transfer:
             self.ros1_transfer.SendCmdVel(0.0, 0.0)
@@ -1606,11 +1655,11 @@ class RobotController(object):
         self.last_linear_velocity = 0.0
         self.ResetTargetPrediction()
         self.DrawOdomPose(frame, odom_pose, 50, odom_topic, odom_status)
-        cv2.putText(frame,"stop",(20,100), cv2.FONT_HERSHEY_PLAIN, 1.2, [0,0,255], 1)
-        cv2.putText(frame,"input ID:",(20,120), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
-        self.DrawIntentInfo(frame, 140)
-        cv2.putText(frame,"v 0.00 m/s",(0,250), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
-        cv2.putText(frame,"w 0.00 rad/s",(0,270), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
+        DrawScreenText(frame, "stop", (20, 100), [0, 0, 255])
+        DrawScreenText(frame, "input ID:", (20, 126), [255, 0, 0])
+        self.DrawIntentInfo(frame, 152)
+        DrawScreenText(frame, "v 0.00 m/s", (0, 255), [255, 0, 0])
+        DrawScreenText(frame, "w 0.00 rad/s", (0, 281), [255, 0, 0])
         return frame
 
     def Run(self, frame, depth_frame=None, color_intrinsics=None, odom_pose=None, odom_topic=None, odom_status=None, key=-1):
