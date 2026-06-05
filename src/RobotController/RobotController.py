@@ -34,6 +34,14 @@ kMaxForwardVelocity = 0.6
 kLinearVelocitySmooth = 0.6
 kAngularHeadingKp = 1.2
 kHeadingDeadband = 0.05
+kUseFuzzyControl = True
+kFuzzyDistanceClose = -0.20
+kFuzzyDistanceOk = 0.0
+kFuzzyDistanceFar = 0.45
+kFuzzyDistanceVeryFar = 1.10
+kFuzzyHeadingSmall = 0.18
+kFuzzyHeadingMedium = 0.50
+kFuzzyHeadingLarge = 1.00
 kPathMinPointDistance = 0.10
 kPathLookaheadDistance = 0.60
 kPathTargetDeadband = 0.08
@@ -675,6 +683,24 @@ class RobotController(object):
         robot_y = origin_y + (grid_info["rows"] - 1) * cell_size
         cv2.circle(frame, (robot_x, robot_y), 3, [255, 255, 255], -1)
 
+    def DrawFuzzyInfo(self, frame, fuzzy_info, y):
+        if fuzzy_info is None:
+            return
+        front_text = "--"
+        if fuzzy_info["front_distance"] is not None:
+            front_text = "{:.2f}".format(fuzzy_info["front_distance"])
+        DrawScreenText(
+            frame,
+            "fuzzy d {} h {} o {} front {}".format(
+                fuzzy_info["distance_label"],
+                fuzzy_info["heading_label"],
+                fuzzy_info["obstacle_label"],
+                front_text,
+            ),
+            (0, y),
+            [0, 180, 255],
+        )
+
     def CreateLocalGridInfo(self):
         rows = int((kLocalGridForwardMax - kLocalGridForwardMin) / kLocalGridResolution) + 1
         cols = int((kLocalGridLateralMax - kLocalGridLateralMin) / kLocalGridResolution) + 1
@@ -1091,6 +1117,157 @@ class RobotController(object):
 
         return 0.0, self.lost_search_direction * kSearchRadianVelocity, 0.0
 
+    def FuzzyRampUp(self, value, start, end):
+        if value <= start:
+            return 0.0
+        if value >= end:
+            return 1.0
+        return (value - start) / max(1e-6, end - start)
+
+    def FuzzyRampDown(self, value, start, end):
+        if value <= start:
+            return 1.0
+        if value >= end:
+            return 0.0
+        return (end - value) / max(1e-6, end - start)
+
+    def FuzzyTriangle(self, value, left, peak, right):
+        if value <= left or value >= right:
+            return 0.0
+        if value == peak:
+            return 1.0
+        if value < peak:
+            return (value - left) / max(1e-6, peak - left)
+        return (right - value) / max(1e-6, right - peak)
+
+    def FuzzyWeightedAverage(self, weighted_values, default_value=0.0):
+        weight_sum = sum(weight for weight, _ in weighted_values)
+        if weight_sum <= 1e-6:
+            return default_value
+        value_sum = sum(weight * value for weight, value in weighted_values)
+        return value_sum / weight_sum
+
+    def GetFuzzyObstacleMembership(self, obstacle_info):
+        front_distance = None
+        if obstacle_info is not None:
+            front_distance = obstacle_info.get("front_distance")
+        if front_distance is None:
+            return {
+                "danger": 0.0,
+                "caution": 0.0,
+                "clear": 1.0,
+                "front_distance": None,
+            }
+
+        danger = self.FuzzyRampDown(front_distance, kObstacleStopDistance, kObstacleSlowDistance)
+        caution = self.FuzzyTriangle(
+            front_distance,
+            kObstacleStopDistance,
+            (kObstacleStopDistance + kObstacleSlowDistance) * 0.5,
+            kObstacleSlowDistance + 0.30,
+        )
+        clear = self.FuzzyRampUp(front_distance, kObstacleSlowDistance, kObstacleSlowDistance + 0.50)
+        return {
+            "danger": danger,
+            "caution": caution,
+            "clear": clear,
+            "front_distance": front_distance,
+        }
+
+    def CalculateFuzzyTargetCommand(self, distance_error, heading_error, obstacle_info, max_forward_velocity):
+        if distance_error is None or heading_error is None:
+            return None, None
+
+        abs_heading = abs(heading_error)
+        distance_membership = {
+            "close": self.FuzzyRampDown(distance_error, kFuzzyDistanceClose, kFuzzyDistanceOk),
+            "ok": self.FuzzyTriangle(distance_error, kFuzzyDistanceClose, kFuzzyDistanceOk, 0.18),
+            "far": self.FuzzyTriangle(distance_error, 0.05, kFuzzyDistanceFar, kFuzzyDistanceVeryFar),
+            "very_far": self.FuzzyRampUp(distance_error, 0.55, kFuzzyDistanceVeryFar),
+        }
+        heading_membership = {
+            "small": self.FuzzyRampDown(abs_heading, kHeadingDeadband, kFuzzyHeadingSmall),
+            "medium": self.FuzzyTriangle(abs_heading, 0.10, kFuzzyHeadingMedium, kFuzzyHeadingLarge),
+            "large": self.FuzzyRampUp(abs_heading, 0.55, kFuzzyHeadingLarge),
+        }
+        obstacle_membership = self.GetFuzzyObstacleMembership(obstacle_info)
+
+        distance_drive = self.FuzzyWeightedAverage(
+            [
+                (distance_membership["close"], 0.0),
+                (distance_membership["ok"], 0.0),
+                (distance_membership["far"], 0.55),
+                (distance_membership["very_far"], 1.0),
+            ],
+            default_value=0.0 if distance_error <= 0.0 else 0.35,
+        )
+        heading_scale = self.FuzzyWeightedAverage(
+            [
+                (heading_membership["small"], 1.0),
+                (heading_membership["medium"], 0.55),
+                (heading_membership["large"], 0.18),
+            ],
+            default_value=1.0,
+        )
+        obstacle_scale = self.FuzzyWeightedAverage(
+            [
+                (obstacle_membership["danger"], 0.0),
+                (obstacle_membership["caution"], 0.45),
+                (obstacle_membership["clear"], 1.0),
+            ],
+            default_value=1.0,
+        )
+
+        target_linear_velocity = max_forward_velocity * distance_drive * heading_scale * obstacle_scale
+        if distance_error <= kDistanceDeadband:
+            target_linear_velocity = 0.0
+        if obstacle_membership["danger"] >= 0.90:
+            target_linear_velocity = 0.0
+
+        if target_linear_velocity <= 0.0:
+            linear_velocity = 0.0
+        else:
+            linear_velocity = (
+                kLinearVelocitySmooth * self.last_linear_velocity
+                + (1.0 - kLinearVelocitySmooth) * target_linear_velocity
+            )
+
+        angular_strength = self.FuzzyWeightedAverage(
+            [
+                (heading_membership["small"], 0.12),
+                (heading_membership["medium"], 0.50),
+                (heading_membership["large"], 0.88),
+            ],
+            default_value=0.0,
+        )
+        if abs_heading < kHeadingDeadband:
+            radian_velocity = 0.0
+        else:
+            radian_velocity = math.copysign(
+                TransferConstants.kMaxRadianVelocity * angular_strength,
+                heading_error,
+            )
+            radian_velocity = max(
+                -TransferConstants.kMaxRadianVelocity,
+                min(TransferConstants.kMaxRadianVelocity, radian_velocity),
+            )
+
+        fuzzy_info = {
+            "distance_error": distance_error,
+            "heading_error": heading_error,
+            "distance_drive": distance_drive,
+            "heading_scale": heading_scale,
+            "obstacle_scale": obstacle_scale,
+            "front_distance": obstacle_membership["front_distance"],
+            "distance_label": max(distance_membership, key=distance_membership.get),
+            "heading_label": max(heading_membership, key=heading_membership.get),
+            "obstacle_label": max(
+                ("danger", "caution", "clear"),
+                key=lambda label: obstacle_membership[label],
+            ),
+        }
+        return (linear_velocity, radian_velocity, target_linear_velocity), fuzzy_info
+
     def IsOdomValid(self, odom_pose, odom_status):
         if odom_pose is None:
             return False
@@ -1285,7 +1462,7 @@ class RobotController(object):
             min(TransferConstants.kMaxRadianVelocity, radian_velocity)
         )
 
-    def CalculatePathCommand(self, odom_pose, max_forward_velocity):
+    def CalculatePathCommand(self, odom_pose, max_forward_velocity, obstacle_info=None):
         path_target, path_closest_index, path_target_index = self.GetPathLookaheadTarget(odom_pose)
         path_target_robot = self.TransformOdomToRobot(path_target, odom_pose)
         path_info = {
@@ -1298,6 +1475,7 @@ class RobotController(object):
             "distance": None,
             "heading_error": None,
             "target_linear_velocity": 0.0,
+            "fuzzy_info": None,
         }
 
         if path_target_robot is None:
@@ -1313,6 +1491,18 @@ class RobotController(object):
 
         if control_distance <= kPathTargetDeadband:
             return None, path_info
+
+        if kUseFuzzyControl:
+            fuzzy_command, fuzzy_info = self.CalculateFuzzyTargetCommand(
+                control_distance,
+                heading_error,
+                obstacle_info,
+                max_forward_velocity,
+            )
+            path_info["fuzzy_info"] = fuzzy_info
+            if fuzzy_command is not None:
+                path_info["target_linear_velocity"] = fuzzy_command[2]
+                return fuzzy_command, path_info
 
         radian_velocity = self.ClampRadianVelocity(heading_error)
         target_linear_velocity = 0.0
@@ -1404,6 +1594,7 @@ class RobotController(object):
         frame = cv2.UMat(frame)
         local_grid_info = self.BuildLocalGrid(depth_frame, color_intrinsics, shape[1], shape[0])
         self.last_grid_info = local_grid_info
+        obstacle_info = self.GetObstacleInfo(depth_frame, shape[1], shape[0])
         planner_info = None
         planner_target_robot = None
 
@@ -1449,13 +1640,15 @@ class RobotController(object):
                 control_lateral = person_lateral
             self.UpdateTargetObservation(box, center, person_distance, person_point, person_odom, shape[1], shape[0])
 
-            path_command, path_info = self.CalculatePathCommand(odom_pose, kMaxForwardVelocity)
+            fuzzy_info = None
+            path_command, path_info = self.CalculatePathCommand(odom_pose, kMaxForwardVelocity, obstacle_info)
             path_target = path_info["target"]
             path_closest_index = path_info["closest_index"]
             path_target_index = path_info["target_index"]
             path_target_robot = path_info["target_robot"]
             if path_command is not None:
-                control_mode = "path"
+                fuzzy_info = path_info.get("fuzzy_info")
+                control_mode = "fuzzy_path" if fuzzy_info is not None else "path"
                 linear_velocity, radian_velocity, target_linear_velocity = path_command
                 control_forward = path_info["forward"]
                 control_lateral = path_info["lateral"]
@@ -1464,9 +1657,20 @@ class RobotController(object):
             elif person_point is not None and person_distance is not None:
                 control_mode = "person"
                 heading_error = person_heading_error
-                radian_velocity = self.ClampRadianVelocity(heading_error)
                 distance_error = person_distance - kTargetDistance
-                if distance_error > kDistanceDeadband:
+                if kUseFuzzyControl:
+                    fuzzy_command, fuzzy_info = self.CalculateFuzzyTargetCommand(
+                        distance_error,
+                        heading_error,
+                        obstacle_info,
+                        kMaxForwardVelocity,
+                    )
+                    if fuzzy_command is not None:
+                        control_mode = "fuzzy_person"
+                        linear_velocity, radian_velocity, target_linear_velocity = fuzzy_command
+                else:
+                    radian_velocity = self.ClampRadianVelocity(heading_error)
+                if not kUseFuzzyControl and distance_error > kDistanceDeadband:
                     target_linear_velocity = distance_error * kLinearDistanceKp
                     target_linear_velocity = min(kMaxForwardVelocity, target_linear_velocity)
                     if heading_error is not None:
@@ -1486,7 +1690,6 @@ class RobotController(object):
             if distance_error is None and person_distance is not None:
                 distance_error = person_distance - kTargetDistance
 
-            obstacle_info = self.GetObstacleInfo(depth_frame, shape[1], shape[0])
             linear_velocity, radian_velocity, obstacle_info = self.ApplySafetyLimits(
                 linear_velocity, radian_velocity, obstacle_info, local_grid_info)
             if obstacle_info["active"]:
@@ -1525,13 +1728,20 @@ class RobotController(object):
             if person_distance is not None:
                 DrawScreenText(frame, "depth {:.2f} target {:.2f}".format(person_distance, kTargetDistance), (0, 307), [255, 0, 0])
                 DrawScreenText(frame, "mode {} err {:.2f} target_v {:.2f}".format(control_mode, distance_error, target_linear_velocity), (0, 333), [255, 0, 0])
+                detail_y = 359
+                if fuzzy_info is not None:
+                    self.DrawFuzzyInfo(frame, fuzzy_info, detail_y)
+                    detail_y += kScreenLineHeight
                 if person_point is not None:
-                    DrawScreenText(frame, "rel x {:.2f} z {:.2f} head {:.2f}".format(person_lateral, person_forward, person_heading_error), (0, 359), [255, 0, 0])
+                    DrawScreenText(frame, "rel x {:.2f} z {:.2f} head {:.2f}".format(person_lateral, person_forward, person_heading_error), (0, detail_y), [255, 0, 0])
+                    detail_y += kScreenLineHeight
                     if person_odom is not None:
-                        DrawScreenText(frame, "person odom x {:.2f} y {:.2f}".format(person_odom[0], person_odom[1]), (0, 385), [255, 0, 0])
-                        DrawScreenText(frame, "path n {:d} idx {}->{}".format(len(self.person_path), path_closest_index, path_target_index), (0, 411), [255, 0, 0])
+                        DrawScreenText(frame, "person odom x {:.2f} y {:.2f}".format(person_odom[0], person_odom[1]), (0, detail_y), [255, 0, 0])
+                        detail_y += kScreenLineHeight
+                        DrawScreenText(frame, "path n {:d} idx {}->{}".format(len(self.person_path), path_closest_index, path_target_index), (0, detail_y), [255, 0, 0])
+                        detail_y += kScreenLineHeight
                 if control_forward is not None and heading_error is not None:
-                    DrawScreenText(frame, "ctrl x {:.2f} z {:.2f} head {:.2f}".format(control_lateral, control_forward, heading_error), (0, 437), [255, 0, 0])
+                    DrawScreenText(frame, "ctrl x {:.2f} z {:.2f} head {:.2f}".format(control_lateral, control_forward, heading_error), (0, detail_y), [255, 0, 0])
             else:
                 DrawScreenText(frame, "depth invalid", (0, 307), [0, 0, 255])
 
@@ -1543,7 +1753,7 @@ class RobotController(object):
             self.last_linear_velocity = linear_velocity
             return frame
         else:
-            path_command, path_info = self.CalculatePathCommand(odom_pose, kLostPathMaxForwardVelocity)
+            path_command, path_info = self.CalculatePathCommand(odom_pose, kLostPathMaxForwardVelocity, obstacle_info)
             control_mode = "lost_stop"
             linear_velocity = 0.0
             radian_velocity = 0.0
@@ -1618,7 +1828,6 @@ class RobotController(object):
                     control_mode = "lost_stop"
                     self.track_state = "lost_stop"
 
-            obstacle_info = self.GetObstacleInfo(depth_frame, shape[1], shape[0])
             linear_velocity, radian_velocity, obstacle_info = self.ApplySafetyLimits(
                 linear_velocity, radian_velocity, obstacle_info, local_grid_info)
             if obstacle_info["active"]:

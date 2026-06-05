@@ -233,6 +233,47 @@ class RobotControllerLogicTest(unittest.TestCase):
         self.assertNotEqual(angular, 0.0)
         self.assertEqual(obstacle_info["mode"], "stop_turn")
 
+    def test_fuzzy_control_drives_forward_for_far_centered_target(self):
+        controller = make_controller()
+        obstacle_info = {
+            "front_distance": 2.0,
+            "left_distance": 2.0,
+            "right_distance": 2.0,
+            "front_region": None,
+            "left_region": None,
+            "right_region": None,
+            "active": False,
+            "mode": "clear",
+        }
+
+        command, fuzzy_info = controller.CalculateFuzzyTargetCommand(0.7, 0.0, obstacle_info, 0.6)
+
+        self.assertIsNotNone(command)
+        self.assertGreater(command[2], 0.0)
+        self.assertAlmostEqual(command[1], 0.0)
+        self.assertEqual(fuzzy_info["distance_label"], "far")
+        self.assertEqual(fuzzy_info["obstacle_label"], "clear")
+
+    def test_fuzzy_control_stops_forward_motion_for_danger_obstacle(self):
+        controller = make_controller()
+        obstacle_info = {
+            "front_distance": 0.3,
+            "left_distance": 2.0,
+            "right_distance": 2.0,
+            "front_region": None,
+            "left_region": None,
+            "right_region": None,
+            "active": False,
+            "mode": "clear",
+        }
+
+        command, fuzzy_info = controller.CalculateFuzzyTargetCommand(0.7, 0.0, obstacle_info, 0.6)
+
+        self.assertIsNotNone(command)
+        self.assertEqual(command[0], 0.0)
+        self.assertEqual(command[2], 0.0)
+        self.assertEqual(fuzzy_info["obstacle_label"], "danger")
+
     def test_prediction_uses_odom_velocity(self):
         controller = make_controller()
         original_time = robot_module.time.time
