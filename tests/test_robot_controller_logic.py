@@ -130,12 +130,55 @@ def make_controller():
     controller.branch_plan_initialized = False
     controller.last_reacquire_time = None
     controller.last_reacquire_score = None
+    controller.intent_processor = None
+    controller.intent_thumb_candidate_id = None
+    controller.intent_thumb_confirmations = 0
+    controller.intent_last_result = None
+    controller.intent_last_action = "idle"
     controller.fps_counter = types.SimpleNamespace(Count=lambda: None, GetFps=lambda: 0.0)
     controller.ros2_transfer = types.SimpleNamespace(SendCmdVel=lambda linear, angular: None)
     return controller
 
 
 class RobotControllerLogicTest(unittest.TestCase):
+    def test_standby_intent_requires_consecutive_thumb_before_tracking(self):
+        controller = make_controller()
+
+        first_result = types.SimpleNamespace(
+            person_id=5,
+            gesture_label=robot_module.TRACKING_ENTER_GESTURE,
+            request_tag="standby",
+        )
+        second_result = types.SimpleNamespace(
+            person_id=5,
+            gesture_label=robot_module.TRACKING_ENTER_GESTURE,
+            request_tag="standby",
+        )
+
+        self.assertFalse(controller.HandleStandbyGestureResult(first_result))
+        self.assertFalse(controller.GetIsTracking())
+
+        self.assertTrue(controller.HandleStandbyGestureResult(second_result))
+        self.assertTrue(controller.GetIsTracking())
+        self.assertEqual(controller.GetTargetId(), 5)
+
+    def test_tracking_intent_palm_resets_tracking_state(self):
+        controller = make_controller()
+        controller.is_tracking = True
+        controller.target_id = 7
+        controller.person_path = [(1.0, 0.0)]
+
+        result = types.SimpleNamespace(
+            person_id=7,
+            gesture_label=robot_module.TRACKING_EXIT_GESTURE,
+            request_tag="tracking:7",
+        )
+
+        self.assertTrue(controller.HandleTrackingGestureResult(result))
+        self.assertFalse(controller.GetIsTracking())
+        self.assertEqual(controller.GetTargetId(), robot_module.kDefaultTrackId)
+        self.assertEqual(controller.person_path, [])
+
     def test_depth_grid_marks_obstacle_and_inflates(self):
         controller = make_controller()
         grid_info = controller.BuildLocalGrid(FakeDepthFrame(0.8), FakeIntrinsics(), 100, 80)

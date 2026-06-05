@@ -4,6 +4,16 @@ import math
 import numpy as np
 import time
 
+from config import (
+    AUTONOMOUS_INTENT_ENABLED,
+    QWEN_INTENT_INTERVAL_SECONDS,
+    QWEN_PERSON_TOP_K,
+    QWEN_ROI_PAD_RATIO,
+    TRACKING_ENTER_CONFIRMATIONS,
+    TRACKING_ENTER_GESTURE,
+    TRACKING_EXIT_GESTURE,
+)
+from qwen_vision import PersonGestureCandidate, PersonGestureProcessor
 from . FpsCounter import FpsCounter
 from . YoloWrapper import YoloWrapper
 from . ROSTransfer import TransferConstants
@@ -104,6 +114,17 @@ class RobotController(object):
         self.branch_plan_initialized = False
         self.last_reacquire_time = None
         self.last_reacquire_score = None
+        self.intent_processor = None
+        if AUTONOMOUS_INTENT_ENABLED:
+            self.intent_processor = PersonGestureProcessor(
+                interval_seconds=QWEN_INTENT_INTERVAL_SECONDS,
+                roi_pad_ratio=QWEN_ROI_PAD_RATIO,
+                top_k=QWEN_PERSON_TOP_K,
+            )
+        self.intent_thumb_candidate_id = None
+        self.intent_thumb_confirmations = 0
+        self.intent_last_result = None
+        self.intent_last_action = "idle"
 
     def SetTargetId(self, id):
         self.target_id = id
@@ -129,6 +150,201 @@ class RobotController(object):
             int(box.xyxy[0][2].item()),
             int(box.xyxy[0][3].item()),
         )
+
+    def GetBoxConfidence(self, box):
+        confidence = getattr(box, "conf", None)
+        if confidence is None:
+            return 0.0
+        try:
+            return float(confidence.item())
+        except (AttributeError, TypeError, ValueError):
+            try:
+                return float(confidence[0].item())
+            except (AttributeError, IndexError, TypeError, ValueError):
+                return 0.0
+
+    def BuildPersonGestureCandidate(self, box, display_id=None):
+        track_id = self.GetBoxTrackId(box)
+        if track_id is None:
+            return None
+        if display_id is None:
+            display_id = track_id
+        return PersonGestureCandidate(
+            track_id=track_id,
+            display_id=display_id,
+            bbox=self.GetBoxBounds(box),
+            confidence=self.GetBoxConfidence(box),
+        )
+
+    def BuildPersonGestureCandidates(self, boxes, top_k=QWEN_PERSON_TOP_K):
+        candidates = []
+        for index, box in enumerate(list([] if boxes is None else boxes)):
+            candidate = self.BuildPersonGestureCandidate(box, index + 1)
+            if candidate is not None:
+                candidates.append(candidate)
+        candidates.sort(key=lambda person: person.confidence, reverse=True)
+        if top_k is not None and top_k > 0:
+            candidates = candidates[:top_k]
+        return candidates
+
+    def GetIntentProcessor(self):
+        if not AUTONOMOUS_INTENT_ENABLED:
+            return None
+        return getattr(self, "intent_processor", None)
+
+    def ResetStandbyIntentConfirmation(self):
+        self.intent_thumb_candidate_id = None
+        self.intent_thumb_confirmations = 0
+
+    def StartTrackingTarget(self, target_id, action="start_tracking"):
+        if target_id is None:
+            return False
+        target_id = int(target_id)
+        if target_id == kDefaultTrackId:
+            return False
+        self.SetTargetId(target_id)
+        self.ClearPersonPath()
+        self.id_str = ""
+        self.SetIsTracking(True)
+        self.ResetStandbyIntentConfirmation()
+        self.intent_last_action = "{} id {}".format(action, target_id)
+        return True
+
+    def ResetTrackingState(self, action="reset_tracking"):
+        self.id_str = ""
+        self.SetTargetId(kDefaultTrackId)
+        self.ClearPersonPath()
+        self.SetIsTracking(False)
+        self.ResetStandbyIntentConfirmation()
+        self.intent_last_action = action
+
+    def GetTrackingIntentTag(self, target_id=None):
+        if target_id is None:
+            target_id = self.GetTargetId()
+        return "tracking:{}".format(target_id)
+
+    def ConsumeIntentResult(self):
+        processor = self.GetIntentProcessor()
+        if processor is None:
+            return None
+        result = processor.get_new_gesture_result()
+        if result is not None:
+            self.intent_last_result = result
+        return result
+
+    def HandleStandbyGestureResult(self, result):
+        if result is None or result.request_tag != "standby":
+            return False
+
+        if result.gesture_label != TRACKING_ENTER_GESTURE:
+            self.ResetStandbyIntentConfirmation()
+            self.intent_last_action = "standby saw {}".format(result.gesture_label)
+            return False
+
+        person_id = int(result.person_id)
+        if self.intent_thumb_candidate_id == person_id:
+            self.intent_thumb_confirmations += 1
+        else:
+            self.intent_thumb_candidate_id = person_id
+            self.intent_thumb_confirmations = 1
+
+        self.intent_last_action = "thumb id {} {}/{}".format(
+            person_id,
+            self.intent_thumb_confirmations,
+            TRACKING_ENTER_CONFIRMATIONS,
+        )
+
+        if self.intent_thumb_confirmations < TRACKING_ENTER_CONFIRMATIONS:
+            return False
+
+        return self.StartTrackingTarget(person_id, "intent thumb")
+
+    def HandleTrackingGestureResult(self, result):
+        if result is None:
+            return False
+        if result.request_tag != self.GetTrackingIntentTag():
+            return False
+        if result.gesture_label != TRACKING_EXIT_GESTURE:
+            self.intent_last_action = "tracking saw {}".format(result.gesture_label)
+            return False
+
+        self.ResetTrackingState("intent palm reset")
+        return True
+
+    def UpdateStandbyIntent(self, frame, boxes):
+        processor = self.GetIntentProcessor()
+        if processor is None:
+            return False
+
+        result = self.ConsumeIntentResult()
+        if self.HandleStandbyGestureResult(result):
+            return True
+
+        candidates = self.BuildPersonGestureCandidates(boxes, QWEN_PERSON_TOP_K)
+        if len(candidates) == 0:
+            self.ResetStandbyIntentConfirmation()
+            self.intent_last_action = "standby no candidates"
+            return False
+
+        processor.process_if_due(
+            frame,
+            candidates,
+            priority_labels=(TRACKING_ENTER_GESTURE,),
+            top_k=QWEN_PERSON_TOP_K,
+            request_tag="standby",
+        )
+        return False
+
+    def UpdateTrackingIntent(self, frame, target_box):
+        processor = self.GetIntentProcessor()
+        if processor is None:
+            return False
+
+        result = self.ConsumeIntentResult()
+        if self.HandleTrackingGestureResult(result):
+            return True
+
+        candidate = None
+        if target_box is not None:
+            candidate = self.BuildPersonGestureCandidate(target_box)
+        if candidate is None:
+            self.intent_last_action = "tracking target not visible"
+            return False
+
+        processor.process_if_due(
+            frame,
+            [candidate],
+            priority_labels=(TRACKING_EXIT_GESTURE,),
+            top_k=1,
+            request_tag=self.GetTrackingIntentTag(candidate.track_id),
+        )
+        return False
+
+    def DrawIntentInfo(self, frame, y):
+        if not AUTONOMOUS_INTENT_ENABLED:
+            cv2.putText(frame, "intent disabled", (0, y), cv2.FONT_HERSHEY_PLAIN, 1.2, [128, 128, 128], 1)
+            return
+
+        confirm_id = getattr(self, "intent_thumb_candidate_id", None)
+        confirm_count = getattr(self, "intent_thumb_confirmations", 0)
+        action = getattr(self, "intent_last_action", "idle")
+        if self.GetIsTracking():
+            mode_text = "intent tracking palm reset"
+        else:
+            mode_text = "intent standby thumb id {} {}/{}".format(
+                "--" if confirm_id is None else confirm_id,
+                confirm_count,
+                TRACKING_ENTER_CONFIRMATIONS,
+            )
+
+        cv2.putText(frame, mode_text, (0, y), cv2.FONT_HERSHEY_PLAIN, 1.2, [0, 128, 255], 1)
+        cv2.putText(frame, "intent action {}".format(action), (0, y + 18), cv2.FONT_HERSHEY_PLAIN, 1.2, [0, 128, 255], 1)
+
+        processor = self.GetIntentProcessor()
+        if processor is None:
+            return
+        for index, line in enumerate(processor.status_lines[:3]):
+            cv2.putText(frame, line, (0, y + 36 + index * 18), cv2.FONT_HERSHEY_PLAIN, 1.2, [0, 128, 255], 1)
 
     def FindTarget(self, boxes):
         for box in boxes:
@@ -1133,21 +1349,15 @@ class RobotController(object):
                 self.id_str = self.id_str[:-1]
             elif key == 10 or key == 13 or key == 141:  # 回车
                 if(self.id_str == ""):
-                    self.SetTargetId(0)
+                    target_id = kDefaultTrackId
                 else:
-                    self.SetTargetId(int(self.id_str))
-                self.ClearPersonPath()
+                    target_id = int(self.id_str)
                 self.id_str = ""
-
-            if(self.GetTargetId() != kDefaultTrackId):
-                self.SetIsTracking(True)
+                self.StartTrackingTarget(target_id, "keyboard")
 
         else:
             if key == 10 or key == 13 or key == 141:  # 回车
-                self.id_str = ""
-                self.target_id = 0
-                self.ClearPersonPath()
-                self.SetIsTracking(False)
+                self.ResetTrackingState("keyboard reset")
         return frame
 
     def TrackAndDraw(self, frame, box, depth_frame=None, color_intrinsics=None, odom_pose=None, odom_topic=None, odom_status=None, key=-1):
@@ -1256,6 +1466,7 @@ class RobotController(object):
             cv2.putText(frame,label,(x1,y1+t_size[1]+4), cv2.FONT_HERSHEY_PLAIN, 2, [255,255,255], 2)
 
             cv2.putText(frame,"ID {:} enter reset".format(self.GetTargetId()),(20,125), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
+            self.DrawIntentInfo(frame, 145)
             self.DrawOdomPose(frame, odom_pose, 50, odom_topic, odom_status)
             cv2.putText(frame,"v {:.2f} m/s".format(linear_velocity),(0,250), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
             cv2.putText(frame,"w {:.2f} rad/s".format(radian_velocity),(0,270), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
@@ -1371,6 +1582,7 @@ class RobotController(object):
             self.DrawOdomPose(frame, odom_pose, 50, odom_topic, odom_status)
             cv2.putText(frame,"lost ID {:}".format(self.GetTargetId()),(20,100), cv2.FONT_HERSHEY_PLAIN, 1.2, [0,0,255], 1)
             cv2.putText(frame,"enter reset",(20,120), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
+            self.DrawIntentInfo(frame, 140)
             cv2.putText(frame,"v {:.2f} m/s".format(linear_velocity),(0,250), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
             cv2.putText(frame,"w {:.2f} rad/s".format(radian_velocity),(0,270), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
             cv2.putText(frame,"mode {} target_v {:.2f}".format(control_mode, target_linear_velocity),(0,290), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
@@ -1396,24 +1608,36 @@ class RobotController(object):
         self.DrawOdomPose(frame, odom_pose, 50, odom_topic, odom_status)
         cv2.putText(frame,"stop",(20,100), cv2.FONT_HERSHEY_PLAIN, 1.2, [0,0,255], 1)
         cv2.putText(frame,"input ID:",(20,120), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
+        self.DrawIntentInfo(frame, 140)
         cv2.putText(frame,"v 0.00 m/s",(0,250), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
         cv2.putText(frame,"w 0.00 rad/s",(0,270), cv2.FONT_HERSHEY_PLAIN, 1.2, [255,0,0], 1)
         return frame
 
     def Run(self, frame, depth_frame=None, color_intrinsics=None, odom_pose=None, odom_topic=None, odom_status=None, key=-1):
         results = self.yolo_wrapper.Track(frame)
-        if(len(results)>0):
-            if(self.GetIsTracking()):
-                box = self.FindTarget(results[0].boxes)
+        has_results = len(results) > 0
+        boxes = results[0].boxes if has_results else None
+
+        if self.GetIsTracking():
+            box = None
+            if has_results:
+                box = self.FindTarget(boxes)
                 if box is None:
                     shape = frame.shape
                     box = self.ReacquireTarget(
-                        results[0].boxes, depth_frame, color_intrinsics,
+                        boxes, depth_frame, color_intrinsics,
                         odom_pose, shape[1], shape[0])
-                return self.TrackAndDraw(frame, box, depth_frame, color_intrinsics, odom_pose, odom_topic, odom_status, key)
-            else:
-                frame = results[0].plot()
-                return self.NonTrackAndDraw(frame, odom_pose, odom_topic, odom_status, key)
-        if(self.GetIsTracking()):
-            return self.TrackAndDraw(frame, None, depth_frame, color_intrinsics, odom_pose, odom_topic, odom_status, key)
+
+            if self.UpdateTrackingIntent(frame, box):
+                standby_frame = results[0].plot() if has_results else frame
+                return self.NonTrackAndDraw(standby_frame, odom_pose, odom_topic, odom_status, key)
+
+            return self.TrackAndDraw(frame, box, depth_frame, color_intrinsics, odom_pose, odom_topic, odom_status, key)
+
+        if self.UpdateStandbyIntent(frame, boxes):
+            box = self.FindTarget(boxes) if boxes is not None else None
+            return self.TrackAndDraw(frame, box, depth_frame, color_intrinsics, odom_pose, odom_topic, odom_status, key)
+
+        if has_results:
+            frame = results[0].plot()
         return self.NonTrackAndDraw(frame, odom_pose, odom_topic, odom_status, key)
