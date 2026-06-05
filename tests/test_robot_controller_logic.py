@@ -28,19 +28,6 @@ def install_dependency_stubs():
     ultralytics_stub.YOLO = lambda *args, **kwargs: None
     sys.modules["ultralytics"] = ultralytics_stub
 
-    dotenv_stub = types.ModuleType("dotenv")
-    dotenv_stub.load_dotenv = lambda *args, **kwargs: None
-    sys.modules["dotenv"] = dotenv_stub
-
-    openai_stub = types.ModuleType("openai")
-
-    class OpenAI:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    openai_stub.OpenAI = OpenAI
-    sys.modules["openai"] = openai_stub
-
     rclpy_stub = types.ModuleType("rclpy")
     rclpy_stub.ok = lambda: True
     rclpy_stub.init = lambda: None
