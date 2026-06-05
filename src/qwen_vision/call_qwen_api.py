@@ -1,5 +1,8 @@
 import os
 
+from dotenv import load_dotenv
+from openai import OpenAI
+
 from config import (
     QWEN_BASE_URL,
     QWEN_GESTURE_LABELS,
@@ -8,45 +11,29 @@ from config import (
     QWEN_MODEL,
     QWEN_TEMPERATURE,
 )
-from .gesture_result import build_gesture_prompt, parse_gesture_index
 from .image_utils import build_base64_image_url
+from .gesture_result import build_gesture_prompt, parse_gesture_index
 
 
 _client = None
 
 
 def get_client():
-    """Create and cache the DashScope OpenAI-compatible client."""
+    """创建并缓存 openai client."""
     global _client
 
-    if _client is not None:
-        return _client
-
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        load_dotenv = None
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("openai package is required for qwen_vision") from exc
-
-    if load_dotenv is not None:
+    if _client is None:
         load_dotenv()
+        _client = OpenAI(
+            api_key=os.getenv("DASHSCOPE_API_KEY"),
+            base_url=QWEN_BASE_URL,
+        )
 
-    api_key = os.getenv("DASHSCOPE_API_KEY")
-    if not api_key:
-        raise RuntimeError("DASHSCOPE_API_KEY is not set")
-
-    _client = OpenAI(
-        api_key=api_key,
-        base_url=QWEN_BASE_URL,
-    )
     return _client
 
 
 def analyze_gesture(image_bytes, model=QWEN_MODEL):
-    """Send one cropped BGR/JPEG image to Qwen-VL and return the gesture index."""
+    """将图片送入 api 分析手势，返回文本结果."""
     client = get_client()
     image_url = build_base64_image_url(image_bytes)
     prompt = build_gesture_prompt(QWEN_GESTURE_PROMPT, QWEN_GESTURE_LABELS)
